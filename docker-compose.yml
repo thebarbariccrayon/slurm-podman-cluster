@@ -1,0 +1,919 @@
+---
+# Local Slurm cluster: 1 controller, 5 compute nodes, slurmdbd + MariaDB
+# accounting, slurmrestd, an SSH login node, an OpenLDAP directory of demo
+# users, and the Slurm-web dashboard (agent, gateway, Redis cache, Prometheus
+# metrics).
+#
+# `make up FEDERATION=1` (the `federation` profile, plus FEDERATION=1 for the
+# settings below) adds a second cluster, homelab-dc2, standing in for another
+# data center: its own controller, 3 compute nodes, slurmrestd and Slurm-web
+# agent. Both clusters share slurmdbd, the munge key, LDAP and /shared, and
+# directory-sync federates them. See docs/federation.md.
+#
+# Images are built locally (Slurm from ./Dockerfile, Slurm-web from its
+# upstream source) and never pulled from a registry. Shared secrets (munge key,
+# Slurm JWT key, Slurm-web keys) are generated on first start into volumes.
+# Nothing is bind-mounted from the host, so the repo can live anywhere.
+name: slurm-podman-cluster
+
+x-slurm-image: &slurm_image
+  image: "slurm-podman-cluster/slurm:${SLURM_VERSION:-24.11.7}"
+  # Only secrets-init builds the image; every other service reuses it locally.
+  pull_policy: never
+
+# Where Slurm nodes (nslcd) and the Slurm-web gateway look up users: the
+# in-stack ldap service by default, or a site directory set in .env.
+x-ldap-client: &ldap_client
+  LDAP_URI: "${LDAP_URI:-ldap://ldap}"
+  LDAP_USER_BASE: "${LDAP_USER_BASE:-ou=people,dc=cluster,dc=local}"
+  LDAP_GROUP_BASE: "${LDAP_GROUP_BASE:-ou=groups,dc=cluster,dc=local}"
+  LDAP_BIND_DN: "${LDAP_BIND_DN:-}"
+  LDAP_BIND_PASSWORD: "${LDAP_BIND_PASSWORD:-}"
+  LDAP_STARTTLS: "${LDAP_STARTTLS:-no}"
+
+x-compute-node: &compute_node
+  <<: *slurm_image
+  restart: on-failure
+  environment:
+    <<: *ldap_client
+    ROLE: "compute"
+  volumes:
+    - munge-key:/etc/munge
+    - shared-data:/shared
+  # Privileged with a private cgroup namespace gives slurmd a writable
+  # cgroup v2 tree for task/cgroup and proctrack/cgroup without touching the
+  # host's cgroup hierarchy.
+  privileged: true
+  cgroup: private
+  depends_on:
+    slurm-controller:
+      condition: service_healthy
+
+# Compute node of the second cluster: fetches its config from dc2-controller.
+x-dc2-compute-node: &dc2_compute_node
+  <<: *compute_node
+  profiles: ["federation"]
+  environment:
+    <<: *ldap_client
+    ROLE: "compute"
+    SLURM_CONF_SERVER: "dc2-controller"
+  depends_on:
+    dc2-controller:
+      condition: service_healthy
+
+x-slurm-web-build: &slurm_web_build
+  context: "https://github.com/rackslab/Slurm-web.git#v${SLURMWEB_VERSION:-7.0.0}"
+  dockerfile: containers/Dockerfile
+  # Upstream's python:3.13-slim default breaks on arm64: the builder installs
+  # Debian's python3-dev, whose libpython3.13 shadows the image's own once
+  # `venv --copies` moves the interpreter, and pip segfaults. 3.12 has no
+  # Debian counterpart to collide with.
+  args:
+    PYTHON_IMAGE: "docker.io/library/python:3.12-slim"
+    RUNTIME_IMAGE: "docker.io/library/python:3.12-slim"
+
+services:
+
+  secrets-init:
+    <<: *slurm_image
+    build:
+      context: .
+      args:
+        SLURM_VERSION: "${SLURM_VERSION:-24.11.7}"
+    container_name: secrets-init
+    environment:
+      - ROLE=secrets-init
+    volumes:
+      - munge-key:/etc/munge
+      - slurm-jwt:/etc/slurm-jwt
+      - slurm-web-keys:/var/lib/slurm-web
+      - slurm-web-branding:/slurm-web-branding
+      - shared-data:/shared
+
+  slurm-controller:
+    <<: *slurm_image
+    container_name: slurm-controller
+    hostname: controller
+    restart: on-failure
+    environment:
+      <<: *ldap_client
+      ROLE: "controller"
+    volumes:
+      - munge-key:/etc/munge
+      - slurm-jwt:/etc/slurm-jwt:ro
+      - shared-data:/shared
+      # Job state and the job ID counter survive container recreation, so
+      # job IDs are never reused (they key the accounting records).
+      - slurmctld-state:/var/spool/slurmctld
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.2
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+      slurmdbd:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "scontrol", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  compute1:
+    <<: *compute_node
+    container_name: compute1
+    hostname: compute1
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.3
+
+  compute2:
+    <<: *compute_node
+    container_name: compute2
+    hostname: compute2
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.4
+
+  compute3:
+    <<: *compute_node
+    container_name: compute3
+    hostname: compute3
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.5
+
+  compute4:
+    <<: *compute_node
+    container_name: compute4
+    hostname: compute4
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.6
+
+  compute5:
+    <<: *compute_node
+    container_name: compute5
+    hostname: compute5
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.7
+
+  mariadb:
+    image: "docker.io/library/mariadb:11.4"
+    container_name: mariadb
+    restart: always
+    environment:
+      MARIADB_DATABASE: "slurm_acct_db"
+      MARIADB_USER: "slurm"
+      MARIADB_PASSWORD: "slurmdbpass"
+      MARIADB_ROOT_PASSWORD: "slurmroot"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.10
+    ports:
+      - "127.0.0.1:3307:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  slurmdbd:
+    <<: *slurm_image
+    container_name: slurmdbd
+    hostname: slurmdbd
+    restart: on-failure
+    environment:
+      - ROLE=slurmdbd
+    volumes:
+      - munge-key:/etc/munge
+      - slurm-jwt:/etc/slurm-jwt:ro
+      - shared-data:/shared
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.11
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+      mariadb:
+        condition: service_healthy
+
+  slurmrestd:
+    <<: *slurm_image
+    container_name: slurmrestd
+    hostname: slurmrestd
+    restart: on-failure
+    environment:
+      <<: *ldap_client
+      ROLE: "rest"
+    ports:
+      - "127.0.0.1:6820:6820"
+    volumes:
+      - munge-key:/etc/munge
+      - shared-data:/shared
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.12
+    depends_on:
+      slurm-controller:
+        condition: service_healthy
+    cap_add:
+      - SYS_ADMIN
+      - IPC_LOCK
+    security_opt:
+      - seccomp=unconfined
+
+  # SSH login node for submitting jobs as the local cluster user (hpcuser) or
+  # any LDAP user. hpcuser has a password when SSH_PASSWORD is non-empty and
+  # public keys from SSH_AUTHORIZED_KEYS (the Makefile fills it from
+  # SSH_PUBKEY); LDAP users sign in with their directory password.
+  login:
+    <<: *slurm_image
+    container_name: login
+    hostname: login
+    restart: on-failure
+    environment:
+      <<: *ldap_client
+      ROLE: "login"
+      SSH_PASSWORD: "${SSH_PASSWORD-hpcuser}"
+      SSH_AUTHORIZED_KEYS: "${SSH_AUTHORIZED_KEYS:-}"
+    ports:
+      - "127.0.0.1:${SSH_PORT:-2222}:22"
+    volumes:
+      - munge-key:/etc/munge
+      - login-ssh-hostkeys:/etc/ssh/hostkeys
+      - shared-data:/shared
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.13
+    depends_on:
+      slurm-controller:
+        condition: service_healthy
+      ldap:
+        condition: service_healthy
+
+  # OpenLDAP directory: the local admin account and demo users (see ldap_seed).
+  # Seeded on first start, when the ldap-data volume is empty; password
+  # variables changed later only apply after `make clean`.
+  ldap:
+    image: "slurm-podman-cluster/openldap:latest"
+    pull_policy: never
+    build:
+      context: ./ldap
+    container_name: ldap
+    hostname: ldap
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/openldap/start.sh"]
+    environment:
+      LDAP_ROOT_PASSWORD: "${LDAP_ROOT_PASSWORD:-ldaproot}"
+      DEMO_ADMIN_PASSWORD: "${DEMO_ADMIN_PASSWORD:-admin}"
+      DEMO_USER_PASSWORD: "${DEMO_USER_PASSWORD:-demo}"
+    configs:
+      - source: ldap_start
+        target: /etc/openldap/start.sh
+      - source: ldap_slapd_conf
+        target: /etc/openldap/slapd.conf.in
+      - source: ldap_seed
+        target: /etc/openldap/seed.ldif.in
+    ports:
+      - "127.0.0.1:${LDAP_PORT:-3389}:389"
+    volumes:
+      - ldap-data:/var/lib/openldap/openldap-data
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.14
+    healthcheck:
+      test: ["CMD", "ldapsearch", "-x", "-H", "ldap://localhost", "-b", "dc=cluster,dc=local", "-s", "base"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # One-shot: makes the directory's users usable on the cluster. Creates their
+  # home directories on /shared and mirrors the LDAP groups in
+  # SLURM_ACCOUNT_GROUPS into Slurm accounts; members of the admin group become
+  # Slurm administrators. Rerun after changing the directory: `make sync-users`.
+  directory-sync:
+    <<: *slurm_image
+    container_name: directory-sync
+    environment:
+      <<: *ldap_client
+      ROLE: "directory-sync"
+      SLURM_ACCOUNT_GROUPS: "${SLURM_ACCOUNT_GROUPS:-physics biology chemistry}"
+      SLURM_ADMIN_GROUP: "${SLURMWEB_ADMIN_GROUP:-admins}"
+      # Accounts and users are created on every cluster listed here; with more
+      # than one, they are federated as FEDERATION_NAME.
+      SLURM_CLUSTERS: "homelab-cluster${FEDERATION:+ homelab-dc2}"
+      FEDERATION_NAME: "${FEDERATION_NAME:-homelab}"
+    volumes:
+      - munge-key:/etc/munge
+      - shared-data:/shared
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.15
+    depends_on:
+      slurm-controller:
+        condition: service_healthy
+      ldap:
+        condition: service_healthy
+
+  # --- Second cluster (data center 2), profile "federation" ----------------
+  # Same image and LDAP directory as the first cluster; its own slurm.conf
+  # (slurm-dc2.conf) and addresses in 172.30.1.0/24.
+  dc2-controller:
+    <<: *slurm_image
+    profiles: ["federation"]
+    container_name: dc2-controller
+    hostname: dc2-controller
+    restart: on-failure
+    environment:
+      <<: *ldap_client
+      ROLE: "controller"
+      SLURM_CONF_SOURCE: "slurm-dc2.conf"
+    volumes:
+      - munge-key:/etc/munge
+      - slurm-jwt:/etc/slurm-jwt:ro
+      - shared-data:/shared
+      - dc2-slurmctld-state:/var/spool/slurmctld
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.1.2
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+      slurmdbd:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "scontrol", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  dc2-compute1:
+    <<: *dc2_compute_node
+    container_name: dc2-compute1
+    hostname: dc2-compute1
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.1.3
+
+  dc2-compute2:
+    <<: *dc2_compute_node
+    container_name: dc2-compute2
+    hostname: dc2-compute2
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.1.4
+
+  dc2-compute3:
+    <<: *dc2_compute_node
+    container_name: dc2-compute3
+    hostname: dc2-compute3
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.1.5
+
+  # slurmrestd for the second cluster, used by its Slurm-web agent. Not
+  # published on the host; the first cluster's API stays on port 6820.
+  dc2-slurmrestd:
+    <<: *slurm_image
+    profiles: ["federation"]
+    container_name: dc2-slurmrestd
+    hostname: dc2-slurmrestd
+    restart: on-failure
+    environment:
+      <<: *ldap_client
+      ROLE: "rest"
+      SLURM_CONF_SOURCE: "slurm-dc2.conf"
+    volumes:
+      - munge-key:/etc/munge
+      - shared-data:/shared
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.1.12
+    depends_on:
+      dc2-controller:
+        condition: service_healthy
+    cap_add:
+      - SYS_ADMIN
+      - IPC_LOCK
+    security_opt:
+      - seccomp=unconfined
+
+  # Slurm-web agent for the second cluster. Its cache needs its own Redis:
+  # the agent's cache keys are not namespaced by cluster.
+  dc2-slurm-web-agent:
+    image: "slurm-podman-cluster/slurm-web-agent:${SLURMWEB_VERSION:-7.0.0}"
+    pull_policy: never
+    profiles: ["federation"]
+    container_name: dc2-slurm-web-agent
+    hostname: dc2-slurm-web-agent
+    restart: unless-stopped
+    configs:
+      - source: slurm_web_agent_dc2
+        target: /etc/slurm-web/agent.ini
+      - source: slurm_web_policy
+        target: /etc/slurm-web/policy.ini
+    volumes:
+      - slurm-web-keys:/var/lib/slurm-web
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.1.22
+    depends_on:
+      slurm-web-agent:
+        condition: service_started
+      dc2-slurmrestd:
+        condition: service_started
+      dc2-redis:
+        condition: service_started
+
+  dc2-redis:
+    image: "docker.io/library/redis:7-alpine"
+    profiles: ["federation"]
+    container_name: dc2-slurm-web-redis
+    restart: unless-stopped
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.1.20
+
+  # Slurm-web (https://github.com/rackslab/Slurm-web). Upstream only publishes
+  # amd64 images, so agent and gateway are built from the tagged source.
+  slurm-web-init:
+    image: "slurm-podman-cluster/slurm-web-gateway:${SLURMWEB_VERSION:-7.0.0}"
+    pull_policy: never
+    container_name: slurm-web-init
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        /opt/slurm-web-venv/bin/slurm-web gen-jwt-key &&
+        /opt/slurm-web-venv/bin/slurm-web gen-session-key
+    # The generators load gateway settings, which require [agents] url.
+    configs:
+      - source: slurm_web_gateway
+        target: /etc/slurm-web/gateway.ini
+    volumes:
+      - slurm-web-keys:/var/lib/slurm-web
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+
+  slurm-web-agent:
+    image: "slurm-podman-cluster/slurm-web-agent:${SLURMWEB_VERSION:-7.0.0}"
+    pull_policy: never
+    build:
+      <<: *slurm_web_build
+      target: agent
+    container_name: slurm-web-agent
+    hostname: slurm-web-agent
+    restart: unless-stopped
+    configs:
+      - source: slurm_web_agent
+        target: /etc/slurm-web/agent.ini
+      - source: slurm_web_policy
+        target: /etc/slurm-web/policy.ini
+    volumes:
+      - slurm-web-keys:/var/lib/slurm-web
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.22
+    depends_on:
+      slurm-web-init:
+        condition: service_completed_successfully
+      slurmrestd:
+        condition: service_started
+      redis:
+        condition: service_started
+
+  slurm-web-gateway:
+    image: "slurm-podman-cluster/slurm-web-gateway:${SLURMWEB_VERSION:-7.0.0}"
+    pull_policy: never
+    build:
+      <<: *slurm_web_build
+      target: gateway
+    container_name: slurm-web-gateway
+    hostname: slurm-web-gateway
+    restart: unless-stopped
+    configs:
+      - source: slurm_web_gateway
+        target: /etc/slurm-web/gateway.ini
+      - source: slurm_web_gateway_wsgi
+        target: /usr/share/slurm-web/wsgi/gateway/slurm-web-gateway.py
+      - source: slurm_web_ldap_bind_password
+        target: /etc/slurm-web/ldap-bind-password
+      - source: slurm_web_ldap_cacert
+        target: /etc/slurm-web/ldap-ca.pem
+    ports:
+      - "127.0.0.1:5011:5011"
+    volumes:
+      - slurm-web-keys:/var/lib/slurm-web
+      - slurm-web-branding:/etc/slurm-web/branding:ro
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.23
+    depends_on:
+      slurm-web-init:
+        condition: service_completed_successfully
+      slurm-web-agent:
+        condition: service_started
+      dc2-slurm-web-agent:
+        condition: service_started
+        required: false
+      ldap:
+        condition: service_healthy
+
+  redis:
+    image: "docker.io/library/redis:7-alpine"
+    container_name: slurm-web-redis
+    restart: unless-stopped
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.20
+
+  prometheus:
+    image: "docker.io/prom/prometheus:v2.55.1"
+    container_name: slurm-web-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    configs:
+      - source: prometheus
+        target: /etc/prometheus/prometheus.yml
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - prometheus-data:/prometheus
+    networks:
+      slurm-net:
+        ipv4_address: 172.30.0.21
+
+configs:
+  slurm_web_agent:
+    content: |
+      [service]
+      cluster="Odin"
+
+      [slurmrestd]
+      uri=http://slurmrestd:6820
+      jwt_user=slurm
+
+      [racksdb]
+      enabled=no
+
+      [cache]
+      enabled=yes
+      host=redis
+
+      [metrics]
+      enabled=yes
+      host=http://prometheus:9090
+      restrict=
+        172.30.0.0/16
+
+  # Agent for the second cluster: same settings, its own slurmrestd, Redis and
+  # Prometheus job.
+  slurm_web_agent_dc2:
+    content: |
+      [service]
+      cluster="Freya"
+
+      [slurmrestd]
+      uri=http://dc2-slurmrestd:6820
+      jwt_user=slurm
+
+      [racksdb]
+      enabled=no
+
+      [cache]
+      enabled=yes
+      host=dc2-redis
+
+      [metrics]
+      enabled=yes
+      host=http://prometheus:9090
+      job=slurm-dc2
+      restrict=
+        172.30.0.0/16
+
+  # Everyone signs in with LDAP; there is no anonymous role, so a token
+  # without a login gets no permissions. Users see only their own jobs
+  # (current and past; the agent matches the Slurm job owner against the LDAP
+  # login name) plus the cluster-wide views. Members of the LDAP group
+  # SLURMWEB_ADMIN_GROUP see every job and can reset the cache.
+  slurm_web_policy:
+    content: |
+      [roles]
+      user=ALL
+      admin=@${SLURMWEB_ADMIN_GROUP:-admins}
+
+      [user]
+      actions=stats-view,jobs-view-own,jobs-view-past-own,nodes-view,partitions-view,qos-view,accounts-view,associations-view,reservations-view,cache-view
+
+      [admin]
+      actions=jobs-view,jobs-view-past,cache-reset
+
+  # LDAP login against the in-stack ldap service, or a site directory set with
+  # LDAP_* variables (see .env.example and docs/ldap-auth.md; keep these
+  # defaults in sync with x-ldap-client). Optional keys are written only
+  # when their variable is set, because an empty value is not the same as
+  # unset to Slurm-web (an empty bind_dn still triggers a bind).
+  slurm_web_gateway:
+    content: |
+      # NC State branding from brand.ncsu.edu: a charcoal sidebar (color_main
+      # also colors primary buttons and links) with Wolfpack Red for the active
+      # entry and Reynolds Red in dark mode; official grays elsewhere. All text
+      # pairs meet WCAG AA. Logos and favicon come from ./branding via
+      # secrets-init.
+      [ui]
+      host=${SLURMWEB_UI_HOST:-http://localhost:5011}
+      color_main=#333333
+      color_darker=#000000
+      color_dark=#cc0000
+      color_verydark=#990000
+      color_light=#f2f2f2
+      color_font_disabled=#cccccc
+      logo_login=/etc/slurm-web/branding/logo_login.png
+      logo_login_dark=/etc/slurm-web/branding/logo_login_dark.png
+      logo_horizontal=/etc/slurm-web/branding/logo_horizontal.png
+      logo_horizontal_dark=/etc/slurm-web/branding/logo_horizontal_dark.png
+      logo_alt=NC State University
+      favicon=/etc/slurm-web/branding/favicon.ico
+
+      # The second agent is listed only with FEDERATION set; the blank line
+      # left otherwise is ignored.
+      [agents]
+      url=
+        http://slurm-web-agent:5012
+        ${FEDERATION:+http://dc2-slurm-web-agent:5012}
+
+      # Login is mandatory: the gateway refuses anonymous access.
+      [authentication]
+      enabled=yes
+      method=ldap
+
+      [ldap]
+      uri=${LDAP_URI:-ldap://ldap}
+      user_base=${LDAP_USER_BASE:-ou=people,dc=cluster,dc=local}
+      group_base=${LDAP_GROUP_BASE:-ou=groups,dc=cluster,dc=local}
+      ${LDAP_STARTTLS:+starttls=${LDAP_STARTTLS}}
+      ${LDAP_CACERT_PEM:+cacert=/etc/slurm-web/ldap-ca.pem}
+      ${LDAP_BIND_DN:+bind_dn=${LDAP_BIND_DN}}
+      ${LDAP_BIND_DN:+bind_password_file=/etc/slurm-web/ldap-bind-password}
+      ${LDAP_USER_CLASS:+user_class=${LDAP_USER_CLASS}}
+      ${LDAP_USER_NAME_ATTRIBUTE:+user_name_attribute=${LDAP_USER_NAME_ATTRIBUTE}}
+      ${LDAP_USER_FULLNAME_ATTRIBUTE:+user_fullname_attribute=${LDAP_USER_FULLNAME_ATTRIBUTE}}
+      ${LDAP_GROUP_NAME_ATTRIBUTE:+group_name_attribute=${LDAP_GROUP_NAME_ATTRIBUTE}}
+      ${LDAP_GROUP_OBJECT_CLASSES:+group_object_classes=${LDAP_GROUP_OBJECT_CLASSES}}
+      ${LDAP_LOOKUP_AS_USER:+lookup_as_user=${LDAP_LOOKUP_AS_USER}}
+      ${LDAP_RESTRICTED_GROUPS:+restricted_groups=${LDAP_RESTRICTED_GROUPS}}
+
+  # Service-account password and CA bundle for the [ldap] section, only read
+  # when LDAP_BIND_DN / LDAP_CACERT_PEM are set. The gateway reads the password
+  # file verbatim, so it must not end with a newline. Placeholders keep the
+  # content non-empty: Compose treats an empty one as a host file source.
+  slurm_web_ldap_bind_password:
+    content: "${LDAP_BIND_PASSWORD:-unset}"
+
+  slurm_web_ldap_cacert:
+    content: "${LDAP_CACERT_PEM:-unset}"
+
+  # Replacement gunicorn entry point for the gateway. Upstream's config.json
+  # pins API_SERVER to ui.host, so opening the UI at any other origin (e.g.
+  # 127.0.0.1 instead of localhost) makes every API call cross-origin and the
+  # UI fails with "Network Error"; [service] cors only applies to the dev
+  # server. Point API_SERVER at the host the browser actually used instead.
+  slurm_web_gateway_wsgi:
+    content: |
+      import json
+
+      from flask import request
+
+      from slurmweb.apps import SlurmwebAppSeed
+      from slurmweb.apps._defaults import SlurmwebAppDefaults
+      from slurmweb.apps.gateway import SlurmwebAppGateway
+
+      application = SlurmwebAppGateway(
+          SlurmwebAppSeed.with_parameters(
+              debug=False,
+              log_flags=["ALL"],
+              log_component=None,
+              debug_flags=[],
+              conf_defs=SlurmwebAppDefaults.GATEWAY.settings_definition,
+              conf=SlurmwebAppDefaults.GATEWAY.site_configuration,
+          )
+      )
+
+
+      @application.after_request
+      def same_origin_api_server(response):
+          """Serve config.json with API_SERVER set to the requesting origin."""
+          if request.path.endswith("/config.json") and response.is_json:
+              config = response.get_json()
+              config["API_SERVER"] = request.host_url.rstrip("/")
+              response.set_data(json.dumps(config))
+          return response
+
+  # Writes slapd.conf with a hashed root password, loads the seed LDIF into an
+  # empty database, then runs slapd in the foreground as the ldap user.
+  ldap_start:
+    content: |
+      set -eu
+      DATA=/var/lib/openldap/openldap-data
+      hash() { slappasswd -s "$$1"; }
+      sed "s|@ROOTPW@|$$(hash "$$LDAP_ROOT_PASSWORD")|" \
+        /etc/openldap/slapd.conf.in >/etc/openldap/slapd.conf
+      if [ ! -s "$$DATA/data.mdb" ]; then
+        echo "Seeding LDAP directory..."
+        sed -e "s|@ADMIN_PW@|$$(hash "$$DEMO_ADMIN_PASSWORD")|" \
+            -e "s|@USER_PW@|$$(hash "$$DEMO_USER_PASSWORD")|" \
+            /etc/openldap/seed.ldif.in | slapadd -f /etc/openldap/slapd.conf
+      fi
+      chown -R ldap:ldap "$$DATA"
+      mkdir -p /run/openldap && chown ldap:ldap /run/openldap
+      exec slapd -d stats -h ldap:/// -u ldap -g ldap -f /etc/openldap/slapd.conf
+
+  ldap_slapd_conf:
+    content: |
+      include /etc/openldap/schema/core.schema
+      include /etc/openldap/schema/cosine.schema
+      include /etc/openldap/schema/inetorgperson.schema
+      include /etc/openldap/schema/nis.schema
+
+      modulepath /usr/lib/openldap
+      moduleload back_mdb.so
+      pidfile /run/openldap/slapd.pid
+
+      # Anyone may read users and groups (the nodes' nslcd searches
+      # anonymously); password hashes are only usable to bind.
+      access to attrs=userPassword
+        by self write
+        by anonymous auth
+        by * none
+      access to * by * read
+
+      database mdb
+      maxsize 104857600
+      suffix "dc=cluster,dc=local"
+      rootdn "cn=manager,dc=cluster,dc=local"
+      rootpw @ROOTPW@
+      directory /var/lib/openldap/openldap-data
+      index objectClass,uid,uidNumber,gidNumber,cn,memberUid eq
+
+  # Demo directory. admin is the local administrator (Slurm-web admin role and
+  # Slurm AdminLevel=Administrator); the others belong to research groups that
+  # directory-sync turns into Slurm accounts. dave is in two groups. UIDs start
+  # at 3000 to stay clear of hpcuser (2000).
+  ldap_seed:
+    content: |
+      dn: dc=cluster,dc=local
+      objectClass: dcObject
+      objectClass: organization
+      dc: cluster
+      o: Slurm demo cluster
+
+      dn: ou=people,dc=cluster,dc=local
+      objectClass: organizationalUnit
+      ou: people
+
+      dn: ou=groups,dc=cluster,dc=local
+      objectClass: organizationalUnit
+      ou: groups
+
+      dn: uid=admin,ou=people,dc=cluster,dc=local
+      objectClass: inetOrgPerson
+      objectClass: posixAccount
+      uid: admin
+      cn: Cluster Admin
+      sn: Admin
+      uidNumber: 3000
+      gidNumber: 3000
+      homeDirectory: /shared/home/admin
+      loginShell: /bin/bash
+      userPassword: @ADMIN_PW@
+
+      dn: uid=alice,ou=people,dc=cluster,dc=local
+      objectClass: inetOrgPerson
+      objectClass: posixAccount
+      uid: alice
+      cn: Alice Physicist
+      sn: Physicist
+      uidNumber: 3001
+      gidNumber: 4001
+      homeDirectory: /shared/home/alice
+      loginShell: /bin/bash
+      userPassword: @USER_PW@
+
+      dn: uid=bob,ou=people,dc=cluster,dc=local
+      objectClass: inetOrgPerson
+      objectClass: posixAccount
+      uid: bob
+      cn: Bob Physicist
+      sn: Physicist
+      uidNumber: 3002
+      gidNumber: 4001
+      homeDirectory: /shared/home/bob
+      loginShell: /bin/bash
+      userPassword: @USER_PW@
+
+      dn: uid=carol,ou=people,dc=cluster,dc=local
+      objectClass: inetOrgPerson
+      objectClass: posixAccount
+      uid: carol
+      cn: Carol Biologist
+      sn: Biologist
+      uidNumber: 3003
+      gidNumber: 4002
+      homeDirectory: /shared/home/carol
+      loginShell: /bin/bash
+      userPassword: @USER_PW@
+
+      dn: uid=dave,ou=people,dc=cluster,dc=local
+      objectClass: inetOrgPerson
+      objectClass: posixAccount
+      uid: dave
+      cn: Dave Biochemist
+      sn: Biochemist
+      uidNumber: 3004
+      gidNumber: 4002
+      homeDirectory: /shared/home/dave
+      loginShell: /bin/bash
+      userPassword: @USER_PW@
+
+      dn: uid=erin,ou=people,dc=cluster,dc=local
+      objectClass: inetOrgPerson
+      objectClass: posixAccount
+      uid: erin
+      cn: Erin Chemist
+      sn: Chemist
+      uidNumber: 3005
+      gidNumber: 4003
+      homeDirectory: /shared/home/erin
+      loginShell: /bin/bash
+      userPassword: @USER_PW@
+
+      dn: cn=admins,ou=groups,dc=cluster,dc=local
+      objectClass: posixGroup
+      cn: admins
+      gidNumber: 3000
+      memberUid: admin
+
+      dn: cn=physics,ou=groups,dc=cluster,dc=local
+      objectClass: posixGroup
+      cn: physics
+      gidNumber: 4001
+      memberUid: alice
+      memberUid: bob
+
+      dn: cn=biology,ou=groups,dc=cluster,dc=local
+      objectClass: posixGroup
+      cn: biology
+      gidNumber: 4002
+      memberUid: carol
+      memberUid: dave
+
+      dn: cn=chemistry,ou=groups,dc=cluster,dc=local
+      objectClass: posixGroup
+      cn: chemistry
+      gidNumber: 4003
+      memberUid: erin
+      memberUid: dave
+
+  prometheus:
+    content: |
+      global:
+        scrape_interval: 30s
+      scrape_configs:
+        - job_name: slurm
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["slurm-web-agent:5012"]
+        # Second cluster; simply down unless FEDERATION is enabled.
+        - job_name: slurm-dc2
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["dc2-slurm-web-agent:5012"]
+
+volumes:
+  munge-key:
+  slurm-jwt:
+  slurm-web-keys:
+  slurm-web-branding:
+  login-ssh-hostkeys:
+  ldap-data:
+  mariadb-data:
+  prometheus-data:
+  slurmctld-state:
+  dc2-slurmctld-state:
+  shared-data:
+
+networks:
+  slurm-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

@@ -1,0 +1,8 @@
+# Keep LF endings on every platform: the shell scripts, Makefile, configs and
+# entrypoint are run by bash/make or copied into Linux images, and a CRLF
+# checkout on Windows would break them.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary
+*.ico binary

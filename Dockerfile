@@ -4,8 +4,8 @@ FROM ubuntu:22.04
 
 # Single image for every Slurm role (controller, compute, slurmdbd, slurmrestd);
 # the role is chosen at runtime by entrypoint.sh via $ROLE.
-LABEL maintainer="David Lewellyn <dlewell@ncsu.edu>" \
-      org.opencontainers.image.authors="David Lewellyn <dlewell@ncsu.edu>" \
+LABEL maintainer="David Lewellyn" \
+      org.opencontainers.image.authors="David Lewellyn" \
       org.opencontainers.image.title="slurm-podman-cluster" \
       org.opencontainers.image.description="Slurm controller and compute node Docker image." \
       org.opencontainers.image.version="1.1.0" \
@@ -112,10 +112,6 @@ RUN mkdir -p /etc/slurm /config && \
 # modes Slurm requires. Copied (not bind-mounted) so the repo can live anywhere,
 # e.g. on a volume the Podman/Docker VM does not share. Rebuild after edits.
 COPY slurm.conf slurm-dc2.conf slurmdbd.conf /config/
-
-# Slurm-web gateway logos and favicon. Configs can only carry text, so
-# secrets-init copies these into the slurm-web-branding volume instead.
-COPY branding/ /config/slurm-web-branding/
 
 # Picks the daemon to start from $ROLE.
 COPY entrypoint.sh /entrypoint.sh

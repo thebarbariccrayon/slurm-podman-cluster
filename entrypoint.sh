@@ -55,16 +55,6 @@ init_cluster_home() {
   chmod 0700 "$home"
 }
 
-# Refresh the Slurm-web branding volume from the image on every start, so a
-# rebuild picks up changed logos.
-init_slurm_web_branding() {
-  local dest=/slurm-web-branding
-  [[ -d "$dest" ]] || return 0
-  find "$dest" -mindepth 1 -delete
-  cp -r /config/slurm-web-branding/. "$dest/"
-  chmod -R a+rX "$dest"
-}
-
 # Resolve directory users and groups through nslcd (NSS and PAM), using the
 # same LDAP_* settings as the Slurm-web gateway. Skipped when LDAP_URI is empty.
 start_nslcd() {
@@ -270,7 +260,6 @@ case "${ROLE:-}" in
     init_munge_key
     init_jwt_key
     init_cluster_home
-    init_slurm_web_branding
     ;;
   controller)
     install_slurm_conf

@@ -1,6 +1,6 @@
 # Slurm Podman Cluster
 
-Maintained by David Lewellyn (NCSU).
+Maintained by David Lewellyn.
 
 A complete [Slurm](https://slurm.schedmd.com/) installation in containers: scheduler, compute nodes, accounting, REST API, an SSH login node, LDAP users and the Slurm-web dashboard, all on one laptop or workstation. Use it to learn Slurm, try configuration changes, or demonstrate multi-site scheduling, without touching a real cluster. Slurm's own [documentation](https://slurm.schedmd.com/documentation.html) and [quick start guide](https://slurm.schedmd.com/quickstart.html) cover the commands used below.
 
@@ -25,7 +25,6 @@ The project structure looks like this:
     ├── Makefile
     ├── .env.example        # optional site settings (LDAP, passwords)
     ├── ldap/Dockerfile     # OpenLDAP demo directory image
-    ├── branding/           # Slurm-web logos and favicon
     └── scripts/
         ├── install_deps.sh # host dependencies for macOS, RHEL, Debian, Arch
         ├── install_deps.ps1 # Windows: sets up WSL2, then runs install_deps.sh
@@ -143,7 +142,7 @@ The port is published on `127.0.0.1` only. Change it with `SSH_PORT`.
 
 ### Slurm-web Dashboard
 
-Open http://localhost:5011 (`make web`); `127.0.0.1` or any other host that reaches the port works too. Signing in is mandatory and there is no anonymous access. Users log in with their LDAP account and see only their own jobs; the local admin (`admin` / `admin`) sees everything. By default the in-stack demo directory is used; to use an existing LDAP or Active Directory server instead, copy `.env.example` to `.env` and fill in the `LDAP_*` settings. See [LDAP Users and Login](./docs/ldap-auth.md). The dashboard uses NC State University branding (charcoal sidebar, Wolfpack Red accents, NC State logos and favicon), configured in the gateway's `[ui]` section with assets from [branding/](./branding/README.md). The agent signs its own short-lived tokens for `slurmrestd` with the shared Slurm JWT key, caches responses in Redis, and Prometheus (http://localhost:9090) scrapes the agent for the dashboard charts.
+Open http://localhost:5011 (`make web`); `127.0.0.1` or any other host that reaches the port works too. Signing in is mandatory and there is no anonymous access. Users log in with their LDAP account and see only their own jobs; the local admin (`admin` / `admin`) sees everything. By default the in-stack demo directory is used; to use an existing LDAP or Active Directory server instead, copy `.env.example` to `.env` and fill in the `LDAP_*` settings. See [LDAP Users and Login](./docs/ldap-auth.md). The agent signs its own short-lived tokens for `slurmrestd` with the shared Slurm JWT key, caches responses in Redis, and Prometheus (http://localhost:9090) scrapes the agent for the dashboard charts.
 
 Upstream only publishes amd64 images, so the agent and gateway are built from the tagged Slurm-web source (`SLURMWEB_VERSION`, default `7.0.0`). The first build takes several minutes. Their configuration is inline in `docker-compose.yml` under `configs:`.
 

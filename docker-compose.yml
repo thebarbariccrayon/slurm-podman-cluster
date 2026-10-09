@@ -87,7 +87,6 @@ services:
       - munge-key:/etc/munge
       - slurm-jwt:/etc/slurm-jwt
       - slurm-web-keys:/var/lib/slurm-web
-      - slurm-web-branding:/slurm-web-branding
       - shared-data:/shared
 
   slurm-controller:
@@ -511,7 +510,6 @@ services:
       - "127.0.0.1:5011:5011"
     volumes:
       - slurm-web-keys:/var/lib/slurm-web
-      - slurm-web-branding:/etc/slurm-web/branding:ro
     networks:
       slurm-net:
         ipv4_address: 172.30.0.23
@@ -624,25 +622,8 @@ configs:
   # unset to Slurm-web (an empty bind_dn still triggers a bind).
   slurm_web_gateway:
     content: |
-      # NC State branding from brand.ncsu.edu: a charcoal sidebar (color_main
-      # also colors primary buttons and links) with Wolfpack Red for the active
-      # entry and Reynolds Red in dark mode; official grays elsewhere. All text
-      # pairs meet WCAG AA. Logos and favicon come from ./branding via
-      # secrets-init.
       [ui]
       host=${SLURMWEB_UI_HOST:-http://localhost:5011}
-      color_main=#333333
-      color_darker=#000000
-      color_dark=#cc0000
-      color_verydark=#990000
-      color_light=#f2f2f2
-      color_font_disabled=#cccccc
-      logo_login=/etc/slurm-web/branding/logo_login.png
-      logo_login_dark=/etc/slurm-web/branding/logo_login_dark.png
-      logo_horizontal=/etc/slurm-web/branding/logo_horizontal.png
-      logo_horizontal_dark=/etc/slurm-web/branding/logo_horizontal_dark.png
-      logo_alt=NC State University
-      favicon=/etc/slurm-web/branding/favicon.ico
 
       # The second agent is listed only with FEDERATION set; the blank line
       # left otherwise is ignored.
@@ -902,7 +883,6 @@ volumes:
   munge-key:
   slurm-jwt:
   slurm-web-keys:
-  slurm-web-branding:
   login-ssh-hostkeys:
   ldap-data:
   mariadb-data:
